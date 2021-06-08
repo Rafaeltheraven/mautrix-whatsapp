@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2019 Tulir Asokan
+// Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -22,18 +22,19 @@ import (
 	"regexp"
 	"strings"
 
-	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/format"
+	"github.com/Rhymen/go-whatsapp"
 
-	"maunium.net/go/mautrix-whatsapp/types"
-	"maunium.net/go/mautrix-whatsapp/whatsapp-ext"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
+	"maunium.net/go/mautrix/id"
 )
 
 var italicRegex = regexp.MustCompile("([\\s>~*]|^)_(.+?)_([^a-zA-Z\\d]|$)")
 var boldRegex = regexp.MustCompile("([\\s>_~]|^)\\*(.+?)\\*([^a-zA-Z\\d]|$)")
 var strikethroughRegex = regexp.MustCompile("([\\s>_*]|^)~(.+?)~([^a-zA-Z\\d]|$)")
 var codeBlockRegex = regexp.MustCompile("```(?:.|\n)+?```")
-var mentionRegex = regexp.MustCompile("@[0-9]+")
+
+const mentionedJIDsContextKey = "net.maunium.whatsapp.mentioned_jids"
 
 type Formatter struct {
 	bridge *Bridge
@@ -52,29 +53,34 @@ func NewFormatter(bridge *Bridge) *Formatter {
 			TabsToSpaces: 4,
 			Newline:      "\n",
 
-			PillConverter: func(mxid, eventID string) string {
+			PillConverter: func(mxid, eventID string, ctx format.Context) string {
 				if mxid[0] == '@' {
-					puppet := bridge.GetPuppetByMXID(mxid)
-					fmt.Println(mxid, puppet)
+					puppet := bridge.GetPuppetByMXID(id.UserID(mxid))
 					if puppet != nil {
+						jids, ok := ctx[mentionedJIDsContextKey].([]whatsapp.JID)
+						if !ok {
+							ctx[mentionedJIDsContextKey] = []whatsapp.JID{puppet.JID}
+						} else {
+							ctx[mentionedJIDsContextKey] = append(jids, puppet.JID)
+						}
 						return "@" + puppet.PhoneNumber()
 					}
 				}
 				return mxid
 			},
-			BoldConverter: func(text string) string {
+			BoldConverter: func(text string, _ format.Context) string {
 				return fmt.Sprintf("*%s*", text)
 			},
-			ItalicConverter: func(text string) string {
+			ItalicConverter: func(text string, _ format.Context) string {
 				return fmt.Sprintf("_%s_", text)
 			},
-			StrikethroughConverter: func(text string) string {
+			StrikethroughConverter: func(text string, _ format.Context) string {
 				return fmt.Sprintf("~%s~", text)
 			},
-			MonospaceConverter: func(text string) string {
+			MonospaceConverter: func(text string, _ format.Context) string {
 				return fmt.Sprintf("```%s```", text)
 			},
-			MonospaceBlockConverter: func(text, language string) string {
+			MonospaceBlockConverter: func(text, language string, _ format.Context) string {
 				return fmt.Sprintf("```%s```", text)
 			},
 		},
@@ -92,24 +98,16 @@ func NewFormatter(bridge *Bridge) *Formatter {
 			}
 			return fmt.Sprintf("<code>%s</code>", str)
 		},
-		mentionRegex: func(str string) string {
-			mxid, displayname := formatter.getMatrixInfoByJID(str[1:] + whatsappExt.NewUserSuffix)
-			return fmt.Sprintf(`<a href="https://matrix.to/#/%s">%s</a>`, mxid, displayname)
-		},
 	}
 	formatter.waReplFuncText = map[*regexp.Regexp]func(string) string{
-		mentionRegex: func(str string) string {
-			_, displayname := formatter.getMatrixInfoByJID(str[1:] + whatsappExt.NewUserSuffix)
-			return displayname
-		},
 	}
 	return formatter
 }
 
-func (formatter *Formatter) getMatrixInfoByJID(jid types.WhatsAppID) (mxid, displayname string) {
+func (formatter *Formatter) getMatrixInfoByJID(jid whatsapp.JID) (mxid id.UserID, displayname string) {
 	if user := formatter.bridge.GetUserByJID(jid); user != nil {
 		mxid = user.MXID
-		displayname = user.MXID
+		displayname = string(user.MXID)
 	} else if puppet := formatter.bridge.GetPuppetByJID(jid); puppet != nil {
 		mxid = puppet.MXID
 		displayname = puppet.Displayname
@@ -117,7 +115,7 @@ func (formatter *Formatter) getMatrixInfoByJID(jid types.WhatsAppID) (mxid, disp
 	return
 }
 
-func (formatter *Formatter) ParseWhatsApp(content *mautrix.Content) {
+func (formatter *Formatter) ParseWhatsApp(content *event.MessageEventContent, mentionedJIDs []whatsapp.JID) {
 	output := html.EscapeString(content.Body)
 	for regex, replacement := range formatter.waReplString {
 		output = regex.ReplaceAllString(output, replacement)
@@ -125,16 +123,25 @@ func (formatter *Formatter) ParseWhatsApp(content *mautrix.Content) {
 	for regex, replacer := range formatter.waReplFunc {
 		output = regex.ReplaceAllStringFunc(output, replacer)
 	}
+	for _, jid := range mentionedJIDs {
+		mxid, displayname := formatter.getMatrixInfoByJID(jid)
+		number := "@" + strings.Replace(jid, whatsapp.NewUserSuffix, "", 1)
+		output = strings.Replace(output, number, fmt.Sprintf(`<a href="https://matrix.to/#/%s">%s</a>`, mxid, displayname), -1)
+		content.Body = strings.Replace(content.Body, number, displayname, -1)
+	}
 	if output != content.Body {
 		output = strings.Replace(output, "\n", "<br/>", -1)
 		content.FormattedBody = output
-		content.Format = mautrix.FormatHTML
+		content.Format = event.FormatHTML
 		for regex, replacer := range formatter.waReplFuncText {
 			content.Body = regex.ReplaceAllStringFunc(content.Body, replacer)
 		}
 	}
 }
 
-func (formatter *Formatter) ParseMatrix(html string) string {
-	return formatter.matrixHTMLParser.Parse(html)
+func (formatter *Formatter) ParseMatrix(html string) (string, []whatsapp.JID) {
+	ctx := make(format.Context)
+	result := formatter.matrixHTMLParser.Parse(html, ctx)
+	mentionedJIDs, _ := ctx[mentionedJIDsContextKey].([]whatsapp.JID)
+	return result, mentionedJIDs
 }

@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"regexp"
 
-	"maunium.net/go/mautrix-appservice"
+	"maunium.net/go/mautrix/appservice"
 )
 
 func (config *Config) NewRegistration() (*appservice.Registration, error) {
@@ -33,6 +33,12 @@ func (config *Config) NewRegistration() (*appservice.Registration, error) {
 
 	config.AppService.ASToken = registration.AppToken
 	config.AppService.HSToken = registration.ServerToken
+
+	// Workaround for https://github.com/matrix-org/synapse/pull/5758
+	registration.SenderLocalpart = appservice.RandomString(32)
+	botRegex := regexp.MustCompile(fmt.Sprintf("^@%s:%s$", config.AppService.Bot.Username, config.Homeserver.Domain))
+	registration.Namespaces.RegisterUserIDs(botRegex, true)
+
 	return registration, nil
 }
 
@@ -52,7 +58,8 @@ func (config *Config) GetRegistration() (*appservice.Registration, error) {
 func (config *Config) copyToRegistration(registration *appservice.Registration) error {
 	registration.ID = config.AppService.ID
 	registration.URL = config.AppService.Address
-	registration.RateLimited = false
+	falseVal := false
+	registration.RateLimited = &falseVal
 	registration.SenderLocalpart = config.AppService.Bot.Username
 
 	userIDRegex, err := regexp.Compile(fmt.Sprintf("^@%s:%s$",

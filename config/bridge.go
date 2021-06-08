@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2019 Tulir Asokan
+// Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -24,10 +24,8 @@ import (
 
 	"github.com/Rhymen/go-whatsapp"
 
-	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix-appservice"
-
-	"maunium.net/go/mautrix-whatsapp/types"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 type BridgeConfig struct {
@@ -36,33 +34,65 @@ type BridgeConfig struct {
 	CommunityTemplate   string `yaml:"community_template"`
 
 	ConnectionTimeout     int  `yaml:"connection_timeout"`
-	LoginQRRegenCount     int  `yaml:"login_qr_regen_count"`
+	FetchMessageOnTimeout bool `yaml:"fetch_message_on_timeout"`
+	DeliveryReceipts      bool `yaml:"delivery_receipts"`
 	MaxConnectionAttempts int  `yaml:"max_connection_attempts"`
 	ConnectionRetryDelay  int  `yaml:"connection_retry_delay"`
 	ReportConnectionRetry bool `yaml:"report_connection_retry"`
+	AggressiveReconnect   bool `yaml:"aggressive_reconnect"`
 	ChatListWait          int  `yaml:"chat_list_wait"`
 	PortalSyncWait        int  `yaml:"portal_sync_wait"`
+	UserMessageBuffer     int  `yaml:"user_message_buffer"`
+	PortalMessageBuffer   int  `yaml:"portal_message_buffer"`
 
 	CallNotices struct {
 		Start bool `yaml:"start"`
 		End   bool `yaml:"end"`
 	} `yaml:"call_notices"`
 
-	InitialChatSync    int    `yaml:"initial_chat_sync_count"`
-	InitialHistoryFill int    `yaml:"initial_history_fill_count"`
-	RecoverChatSync    int    `yaml:"recovery_chat_sync_count"`
-	RecoverHistory     bool   `yaml:"recovery_history_backfill"`
-	SyncChatMaxAge     uint64 `yaml:"sync_max_chat_age"`
+	InitialChatSync      int   `yaml:"initial_chat_sync_count"`
+	InitialHistoryFill   int   `yaml:"initial_history_fill_count"`
+	HistoryDisableNotifs bool  `yaml:"initial_history_disable_notifications"`
+	RecoverChatSync      int   `yaml:"recovery_chat_sync_count"`
+	RecoverHistory       bool  `yaml:"recovery_history_backfill"`
+	ChatMetaSync         bool  `yaml:"chat_meta_sync"`
+	UserAvatarSync       bool  `yaml:"user_avatar_sync"`
+	BridgeMatrixLeave    bool  `yaml:"bridge_matrix_leave"`
+	SyncChatMaxAge       int64 `yaml:"sync_max_chat_age"`
 
-	SyncWithCustomPuppets bool `yaml:"sync_with_custom_puppets"`
-	LoginSharedSecret string `yaml:"login_shared_secret"`
+	SyncWithCustomPuppets bool   `yaml:"sync_with_custom_puppets"`
+	SyncDirectChatList    bool   `yaml:"sync_direct_chat_list"`
+	DefaultBridgeReceipts bool   `yaml:"default_bridge_receipts"`
+	DefaultBridgePresence bool   `yaml:"default_bridge_presence"`
+	LoginSharedSecret     string `yaml:"login_shared_secret"`
 
-	InviteOwnPuppetForBackfilling bool `yaml:"invite_own_puppet_for_backfilling"`
-	PrivateChatPortalMeta         bool `yaml:"private_chat_portal_meta"`
+	InviteOwnPuppetForBackfilling bool   `yaml:"invite_own_puppet_for_backfilling"`
+	PrivateChatPortalMeta         bool   `yaml:"private_chat_portal_meta"`
+	BridgeNotices                 bool   `yaml:"bridge_notices"`
+	ResendBridgeInfo              bool   `yaml:"resend_bridge_info"`
+	MuteBridging                  bool   `yaml:"mute_bridging"`
+	ArchiveTag                    string `yaml:"archive_tag"`
+	PinnedTag                     string `yaml:"pinned_tag"`
+	TagOnlyOnCreate               bool   `yaml:"tag_only_on_create"`
+	MarkReadOnlyOnCreate          bool   `yaml:"mark_read_only_on_create"`
+	EnableStatusBroadcast         bool   `yaml:"enable_status_broadcast"`
+
+	WhatsappThumbnail bool `yaml:"whatsapp_thumbnail"`
 
 	AllowUserInvite bool `yaml:"allow_user_invite"`
 
 	CommandPrefix string `yaml:"command_prefix"`
+
+	Encryption struct {
+		Allow   bool `yaml:"allow"`
+		Default bool `yaml:"default"`
+
+		KeySharing struct {
+			Allow               bool `yaml:"allow"`
+			RequireCrossSigning bool `yaml:"require_cross_signing"`
+			RequireVerification bool `yaml:"require_verification"`
+		} `yaml:"key_sharing"`
+	} `yaml:"encryption"`
 
 	Permissions PermissionConfig `yaml:"permissions"`
 
@@ -75,12 +105,15 @@ type BridgeConfig struct {
 
 func (bc *BridgeConfig) setDefaults() {
 	bc.ConnectionTimeout = 20
-	bc.LoginQRRegenCount = 2
+	bc.FetchMessageOnTimeout = false
+	bc.DeliveryReceipts = false
 	bc.MaxConnectionAttempts = 3
 	bc.ConnectionRetryDelay = -1
 	bc.ReportConnectionRetry = true
 	bc.ChatListWait = 30
 	bc.PortalSyncWait = 600
+	bc.UserMessageBuffer = 1024
+	bc.PortalMessageBuffer = 128
 
 	bc.CallNotices.Start = true
 	bc.CallNotices.End = true
@@ -89,13 +122,20 @@ func (bc *BridgeConfig) setDefaults() {
 	bc.InitialHistoryFill = 20
 	bc.RecoverChatSync = -1
 	bc.RecoverHistory = true
+	bc.ChatMetaSync = true
+	bc.UserAvatarSync = true
+	bc.BridgeMatrixLeave = true
 	bc.SyncChatMaxAge = 259200
 
 	bc.SyncWithCustomPuppets = true
+	bc.DefaultBridgePresence = true
+	bc.DefaultBridgeReceipts = true
 	bc.LoginSharedSecret = ""
 
 	bc.InviteOwnPuppetForBackfilling = true
 	bc.PrivateChatPortalMeta = false
+	bc.BridgeNotices = true
+	bc.EnableStatusBroadcast = true
 }
 
 type umBridgeConfig BridgeConfig
@@ -127,13 +167,13 @@ func (bc *BridgeConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 type UsernameTemplateArgs struct {
-	UserID string
+	UserID id.UserID
 }
 
 func (bc BridgeConfig) FormatDisplayname(contact whatsapp.Contact) (string, int8) {
 	var buf bytes.Buffer
-	if index := strings.IndexRune(contact.Jid, '@'); index > 0 {
-		contact.Jid = "+" + contact.Jid[:index]
+	if index := strings.IndexRune(contact.JID, '@'); index > 0 {
+		contact.JID = "+" + contact.JID[:index]
 	}
 	bc.displaynameTemplate.Execute(&buf, contact)
 	var quality int8
@@ -142,7 +182,7 @@ func (bc BridgeConfig) FormatDisplayname(contact whatsapp.Contact) (string, int8
 		quality = 3
 	case len(contact.Name) > 0 || len(contact.Short) > 0:
 		quality = 2
-	case len(contact.Jid) > 0:
+	case len(contact.JID) > 0:
 		quality = 1
 	default:
 		quality = 0
@@ -150,7 +190,7 @@ func (bc BridgeConfig) FormatDisplayname(contact whatsapp.Contact) (string, int8
 	return buf.String(), quality
 }
 
-func (bc BridgeConfig) FormatUsername(userID types.WhatsAppID) string {
+func (bc BridgeConfig) FormatUsername(userID whatsapp.JID) string {
 	var buf bytes.Buffer
 	bc.usernameTemplate.Execute(&buf, userID)
 	return buf.String()
@@ -232,25 +272,25 @@ func (pc *PermissionConfig) MarshalYAML() (interface{}, error) {
 	return rawPC, nil
 }
 
-func (pc PermissionConfig) IsRelaybotWhitelisted(userID string) bool {
+func (pc PermissionConfig) IsRelaybotWhitelisted(userID id.UserID) bool {
 	return pc.GetPermissionLevel(userID) >= PermissionLevelRelaybot
 }
 
-func (pc PermissionConfig) IsWhitelisted(userID string) bool {
+func (pc PermissionConfig) IsWhitelisted(userID id.UserID) bool {
 	return pc.GetPermissionLevel(userID) >= PermissionLevelUser
 }
 
-func (pc PermissionConfig) IsAdmin(userID string) bool {
+func (pc PermissionConfig) IsAdmin(userID id.UserID) bool {
 	return pc.GetPermissionLevel(userID) >= PermissionLevelAdmin
 }
 
-func (pc PermissionConfig) GetPermissionLevel(userID string) PermissionLevel {
-	permissions, ok := pc[userID]
+func (pc PermissionConfig) GetPermissionLevel(userID id.UserID) PermissionLevel {
+	permissions, ok := pc[string(userID)]
 	if ok {
 		return permissions
 	}
 
-	_, homeserver := appservice.ParseUserID(userID)
+	_, homeserver, _ := userID.Parse()
 	permissions, ok = pc[homeserver]
 	if len(homeserver) > 0 && ok {
 		return permissions
@@ -265,12 +305,12 @@ func (pc PermissionConfig) GetPermissionLevel(userID string) PermissionLevel {
 }
 
 type RelaybotConfig struct {
-	Enabled        bool                 `yaml:"enabled"`
-	ManagementRoom string               `yaml:"management"`
-	InviteUsers    []types.MatrixUserID `yaml:"invites"`
+	Enabled        bool        `yaml:"enabled"`
+	ManagementRoom id.RoomID   `yaml:"management"`
+	InviteUsers    []id.UserID `yaml:"invites"`
 
-	MessageFormats   map[mautrix.MessageType]string `yaml:"message_formats"`
-	messageTemplates *template.Template             `yaml:"-"`
+	MessageFormats   map[event.MessageType]string `yaml:"message_formats"`
+	messageTemplates *template.Template           `yaml:"-"`
 }
 
 type umRelaybotConfig RelaybotConfig
@@ -293,25 +333,25 @@ func (rc *RelaybotConfig) UnmarshalYAML(unmarshal func(interface{}) error) error
 }
 
 type Sender struct {
-	UserID types.MatrixUserID
-	mautrix.Member
+	UserID id.UserID
+	*event.MemberEventContent
 }
 
 type formatData struct {
 	Sender  Sender
 	Message string
-	Content mautrix.Content
+	Content *event.MessageEventContent
 }
 
-func (rc *RelaybotConfig) FormatMessage(evt *mautrix.Event, member mautrix.Member) (string, error) {
+func (rc *RelaybotConfig) FormatMessage(content *event.MessageEventContent, sender id.UserID, member *event.MemberEventContent) (string, error) {
 	var output strings.Builder
-	err := rc.messageTemplates.ExecuteTemplate(&output, string(evt.Content.MsgType), formatData{
+	err := rc.messageTemplates.ExecuteTemplate(&output, string(content.MsgType), formatData{
 		Sender: Sender{
-			UserID: evt.Sender,
-			Member: member,
+			UserID:             sender,
+			MemberEventContent: member,
 		},
-		Content: evt.Content,
-		Message: evt.Content.FormattedBody,
+		Content: content,
+		Message: content.FormattedBody,
 	})
 	return output.String(), err
 }

@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2019 Tulir Asokan
+// Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -20,17 +20,15 @@ import (
 	"crypto/hmac"
 	"crypto/sha512"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"os"
-	"strings"
+	"errors"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/Rhymen/go-whatsapp"
+
 	"maunium.net/go/mautrix"
-	appservice "maunium.net/go/mautrix-appservice"
+	"maunium.net/go/mautrix/appservice"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 var (
@@ -38,7 +36,7 @@ var (
 	ErrMismatchingMXID = errors.New("whoami result does not match custom mxid")
 )
 
-func (puppet *Puppet) SwitchCustomMXID(accessToken string, mxid string) error {
+func (puppet *Puppet) SwitchCustomMXID(accessToken string, mxid id.UserID) error {
 	prevCustomMXID := puppet.CustomMXID
 	if puppet.customIntent != nil {
 		puppet.stopSyncing()
@@ -46,7 +44,7 @@ func (puppet *Puppet) SwitchCustomMXID(accessToken string, mxid string) error {
 	puppet.CustomMXID = mxid
 	puppet.AccessToken = accessToken
 
-	err := puppet.StartCustomMXID()
+	err := puppet.StartCustomMXID(false)
 	if err != nil {
 		return err
 	}
@@ -57,18 +55,21 @@ func (puppet *Puppet) SwitchCustomMXID(accessToken string, mxid string) error {
 	if len(puppet.CustomMXID) > 0 {
 		puppet.bridge.puppetsByCustomMXID[puppet.CustomMXID] = puppet
 	}
+	puppet.EnablePresence = puppet.bridge.Config.Bridge.DefaultBridgePresence
+	puppet.EnableReceipts = puppet.bridge.Config.Bridge.DefaultBridgeReceipts
 	puppet.bridge.AS.StateStore.MarkRegistered(puppet.CustomMXID)
 	puppet.Update()
 	// TODO leave rooms with default puppet
 	return nil
 }
 
-func (puppet *Puppet) loginWithSharedSecret(mxid string) (string, error) {
+func (puppet *Puppet) loginWithSharedSecret(mxid id.UserID) (string, error) {
+	puppet.log.Debugfln("Logging into %s with shared secret", mxid)
 	mac := hmac.New(sha512.New, []byte(puppet.bridge.Config.Bridge.LoginSharedSecret))
 	mac.Write([]byte(mxid))
 	resp, err := puppet.bridge.AS.BotClient().Login(&mautrix.ReqLogin{
-		Type:                     "m.login.password",
-		Identifier:               mautrix.UserIdentifier{Type: "m.id.user", User: mxid},
+		Type:                     mautrix.AuthTypePassword,
+		Identifier:               mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: string(mxid)},
 		Password:                 hex.EncodeToString(mac.Sum(nil)),
 		DeviceID:                 "WhatsApp Bridge",
 		InitialDeviceDisplayName: "WhatsApp Bridge",
@@ -87,13 +88,15 @@ func (puppet *Puppet) newCustomIntent() (*appservice.IntentAPI, error) {
 	if err != nil {
 		return nil, err
 	}
-	client.Logger = puppet.bridge.AS.Log.Sub(puppet.CustomMXID)
+	client.Logger = puppet.bridge.AS.Log.Sub(string(puppet.CustomMXID))
+	client.Client = puppet.bridge.AS.HTTPClient
+	client.DefaultHTTPRetries = puppet.bridge.AS.DefaultHTTPRetries
 	client.Syncer = puppet
 	client.Store = puppet
 
 	ia := puppet.bridge.AS.NewIntentAPI("custom")
 	ia.Client = client
-	ia.Localpart = puppet.CustomMXID[1:strings.IndexRune(puppet.CustomMXID, ':')]
+	ia.Localpart, _, _ = puppet.CustomMXID.Parse()
 	ia.UserID = puppet.CustomMXID
 	ia.IsCustomPuppet = true
 	return ia, nil
@@ -107,7 +110,7 @@ func (puppet *Puppet) clearCustomMXID() {
 	puppet.customUser = nil
 }
 
-func (puppet *Puppet) StartCustomMXID() error {
+func (puppet *Puppet) StartCustomMXID(reloginOnFail bool) error {
 	if len(puppet.CustomMXID) == 0 {
 		puppet.clearCustomMXID()
 		return nil
@@ -117,21 +120,19 @@ func (puppet *Puppet) StartCustomMXID() error {
 		puppet.clearCustomMXID()
 		return err
 	}
-	urlPath := intent.BuildURL("account", "whoami")
-	var resp struct {
-		UserID string `json:"user_id"`
-	}
-	_, err = intent.MakeRequest("GET", urlPath, nil, &resp)
+	resp, err := intent.Whoami()
 	if err != nil {
-		puppet.clearCustomMXID()
-		return err
-	}
-	if resp.UserID != puppet.CustomMXID {
+		if !reloginOnFail || (errors.Is(err, mautrix.MUnknownToken) && !puppet.tryRelogin(err, "initializing double puppeting")) {
+			puppet.clearCustomMXID()
+			return err
+		}
+		intent.AccessToken = puppet.AccessToken
+	} else if resp.UserID != puppet.CustomMXID {
 		puppet.clearCustomMXID()
 		return ErrMismatchingMXID
 	}
 	puppet.customIntent = intent
-	puppet.customTypingIn = make(map[string]bool)
+	puppet.customTypingIn = make(map[id.RoomID]bool)
 	puppet.customUser = puppet.bridge.GetUserByMXID(puppet.CustomMXID)
 	puppet.startSyncing()
 	return nil
@@ -158,69 +159,53 @@ func (puppet *Puppet) stopSyncing() {
 	puppet.customIntent.StopSync()
 }
 
-func parseEvent(roomID string, data json.RawMessage) *mautrix.Event {
-	event := &mautrix.Event{}
-	err := json.Unmarshal(data, event)
-	if err != nil {
-		// TODO add separate handler for these
-		_, _ = fmt.Fprintf(os.Stderr, "Failed to unmarshal event: %v\n%s\n", err, string(data))
-		return nil
-	}
-	return event
-}
-
-func parsePresenceEvent(data json.RawMessage) *mautrix.Event {
-	event := &mautrix.Event{}
-	err := json.Unmarshal(data, event)
-	if err != nil {
-		// TODO add separate handler for these
-		_, _ = fmt.Fprintf(os.Stderr, "Failed to unmarshal event: %v\n%s\n", err, string(data))
-		return nil
-	}
-	return event
-}
-
-func (puppet *Puppet) ProcessResponse(resp *mautrix.RespSync, since string) error {
+func (puppet *Puppet) ProcessResponse(resp *mautrix.RespSync, _ string) error {
 	if !puppet.customUser.IsConnected() {
 		puppet.log.Debugln("Skipping sync processing: custom user not connected to whatsapp")
 		return nil
 	}
 	for roomID, events := range resp.Rooms.Join {
 		portal := puppet.bridge.GetPortalByMXID(roomID)
-		if portal == nil {
+		if portal == nil || portal.IsBroadcastList() {
 			continue
 		}
-		for _, data := range events.Ephemeral.Events {
-			event := parseEvent(roomID, data)
-			if event != nil {
-				switch event.Type {
-				case mautrix.EphemeralEventReceipt:
-					go puppet.handleReceiptEvent(portal, event)
-				case mautrix.EphemeralEventTyping:
-					go puppet.handleTypingEvent(portal, event)
+		for _, evt := range events.Ephemeral.Events {
+			err := evt.Content.ParseRaw(evt.Type)
+			if err != nil {
+				continue
+			}
+			switch evt.Type {
+			case event.EphemeralEventReceipt:
+				if puppet.EnableReceipts {
+					go puppet.handleReceiptEvent(portal, evt)
 				}
+			case event.EphemeralEventTyping:
+				go puppet.handleTypingEvent(portal, evt)
 			}
 		}
 	}
-	for _, data := range resp.Presence.Events {
-		event := parsePresenceEvent(data)
-		if event != nil {
-			if event.Sender != puppet.CustomMXID {
+	if puppet.EnablePresence {
+		for _, evt := range resp.Presence.Events {
+			if evt.Sender != puppet.CustomMXID {
 				continue
 			}
-			go puppet.handlePresenceEvent(event)
+			err := evt.Content.ParseRaw(evt.Type)
+			if err != nil {
+				continue
+			}
+			go puppet.handlePresenceEvent(evt)
 		}
 	}
 	return nil
 }
 
-func (puppet *Puppet) handlePresenceEvent(event *mautrix.Event) {
+func (puppet *Puppet) handlePresenceEvent(event *event.Event) {
 	presence := whatsapp.PresenceAvailable
 	if event.Content.Raw["presence"].(string) != "online" {
 		presence = whatsapp.PresenceUnavailable
-		puppet.customUser.log.Infoln("Marking offline")
+		puppet.customUser.log.Debugln("Marking offline")
 	} else {
-		puppet.customUser.log.Infoln("Marking online")
+		puppet.customUser.log.Debugln("Marking online")
 	}
 	_, err := puppet.customUser.Conn.Presence("", presence)
 	if err != nil {
@@ -228,43 +213,39 @@ func (puppet *Puppet) handlePresenceEvent(event *mautrix.Event) {
 	}
 }
 
-func (puppet *Puppet) handleReceiptEvent(portal *Portal, event *mautrix.Event) {
-	for eventID, rawReceipts := range event.Content.Raw {
-		if receipts, ok := rawReceipts.(map[string]interface{}); !ok {
-			continue
-		} else if readReceipt, ok := receipts["m.read"].(map[string]interface{}); !ok {
-			continue
-		} else if _, ok = readReceipt[puppet.CustomMXID].(map[string]interface{}); !ok {
-			continue
-		}
-		message := puppet.bridge.DB.Message.GetByMXID(eventID)
-		if message == nil {
-			continue
-		}
-		puppet.customUser.log.Infofln("Marking %s/%s in %s/%s as read", message.JID, message.MXID, portal.Key.JID, portal.MXID)
-		_, err := puppet.customUser.Conn.Read(portal.Key.JID, message.JID)
-		if err != nil {
-			puppet.customUser.log.Warnln("Error marking read:", err)
+func (puppet *Puppet) handleReceiptEvent(portal *Portal, event *event.Event) {
+	for eventID, receipts := range *event.Content.AsReceipt() {
+		if receipt, ok := receipts.Read[puppet.CustomMXID]; !ok {
+			// Ignore receipt events where this user isn't present.
+		} else if isDoublePuppeted, _ := receipt.Extra["net.maunium.whatsapp.puppet"].(bool); isDoublePuppeted {
+			puppet.customUser.log.Debugfln("Ignoring double puppeted read receipt %+v", event.Content.Raw)
+			// Ignore double puppeted read receipts.
+		} else if message := puppet.bridge.DB.Message.GetByMXID(eventID); message != nil {
+			puppet.customUser.log.Debugfln("Marking %s/%s in %s/%s as read", message.JID, message.MXID, portal.Key.JID, portal.MXID)
+			_, err := puppet.customUser.Conn.Read(portal.Key.JID, message.JID)
+			if err != nil {
+				puppet.customUser.log.Warnln("Error marking read:", err)
+			}
 		}
 	}
 }
 
-func (puppet *Puppet) handleTypingEvent(portal *Portal, event *mautrix.Event) {
+func (puppet *Puppet) handleTypingEvent(portal *Portal, evt *event.Event) {
 	isTyping := false
-	for _, userID := range event.Content.TypingUserIDs {
+	for _, userID := range evt.Content.AsTyping().UserIDs {
 		if userID == puppet.CustomMXID {
 			isTyping = true
 			break
 		}
 	}
-	if puppet.customTypingIn[event.RoomID] != isTyping {
-		puppet.customTypingIn[event.RoomID] = isTyping
+	if puppet.customTypingIn[evt.RoomID] != isTyping {
+		puppet.customTypingIn[evt.RoomID] = isTyping
 		presence := whatsapp.PresenceComposing
 		if !isTyping {
-			puppet.customUser.log.Infofln("Marking not typing in %s/%s", portal.Key.JID, portal.MXID)
+			puppet.customUser.log.Debugfln("Marking not typing in %s/%s", portal.Key.JID, portal.MXID)
 			presence = whatsapp.PresencePaused
 		} else {
-			puppet.customUser.log.Infofln("Marking typing in %s/%s", portal.Key.JID, portal.MXID)
+			puppet.customUser.log.Debugfln("Marking typing in %s/%s", portal.Key.JID, portal.MXID)
 		}
 		_, err := puppet.customUser.Conn.Presence(portal.Key.JID, presence)
 		if err != nil {
@@ -273,41 +254,54 @@ func (puppet *Puppet) handleTypingEvent(portal *Portal, event *mautrix.Event) {
 	}
 }
 
-func (puppet *Puppet) OnFailedSync(res *mautrix.RespSync, err error) (time.Duration, error) {
+func (puppet *Puppet) tryRelogin(cause error, action string) bool {
+	if !puppet.bridge.Config.CanDoublePuppet(puppet.CustomMXID) {
+		return false
+	}
+	puppet.log.Debugfln("Trying to relogin after '%v' while %s", cause, action)
+	accessToken, err := puppet.loginWithSharedSecret(puppet.CustomMXID)
+	if err != nil {
+		puppet.log.Errorfln("Failed to relogin after '%v' while %s: %v", cause, action, err)
+		return false
+	}
+	puppet.log.Infofln("Successfully relogined after '%v' while %s", cause, action)
+	puppet.AccessToken = accessToken
+	return true
+}
+
+func (puppet *Puppet) OnFailedSync(_ *mautrix.RespSync, err error) (time.Duration, error) {
 	puppet.log.Warnln("Sync error:", err)
+	if errors.Is(err, mautrix.MUnknownToken) {
+		if !puppet.tryRelogin(err, "syncing") {
+			return 0, err
+		}
+		puppet.customIntent.AccessToken = puppet.AccessToken
+		return 0, nil
+	}
 	return 10 * time.Second, nil
 }
 
-func (puppet *Puppet) GetFilterJSON(_ string) json.RawMessage {
-	mxid, _ := json.Marshal(puppet.CustomMXID)
-	return json.RawMessage(fmt.Sprintf(`{
-    "account_data": { "types": [] },
-    "presence": {
-        "senders": [
-            %s
-        ],
-        "types": [
-            "m.presence"
-        ]
-    },
-    "room": {
-        "ephemeral": {
-            "types": [
-                "m.typing",
-                "m.receipt"
-            ]
-        },
-        "include_leave": false,
-        "account_data": { "types": [] },
-        "state": { "types": [] },
-        "timeline": { "types": [] }
-    }
-}`, mxid))
+func (puppet *Puppet) GetFilterJSON(_ id.UserID) *mautrix.Filter {
+	everything := []event.Type{{Type: "*"}}
+	return &mautrix.Filter{
+		Presence: mautrix.FilterPart{
+			Senders: []id.UserID{puppet.CustomMXID},
+			Types:   []event.Type{event.EphemeralEventPresence},
+		},
+		AccountData: mautrix.FilterPart{NotTypes: everything},
+		Room: mautrix.RoomFilter{
+			Ephemeral:    mautrix.FilterPart{Types: []event.Type{event.EphemeralEventTyping, event.EphemeralEventReceipt}},
+			IncludeLeave: false,
+			AccountData:  mautrix.FilterPart{NotTypes: everything},
+			State:        mautrix.FilterPart{NotTypes: everything},
+			Timeline:     mautrix.FilterPart{NotTypes: everything},
+		},
+	}
 }
 
-func (puppet *Puppet) SaveFilterID(_, _ string)             {}
-func (puppet *Puppet) SaveNextBatch(_, nbt string)          { puppet.NextBatch = nbt; puppet.Update() }
-func (puppet *Puppet) SaveRoom(room *mautrix.Room)          {}
-func (puppet *Puppet) LoadFilterID(_ string) string         { return "" }
-func (puppet *Puppet) LoadNextBatch(_ string) string        { return puppet.NextBatch }
-func (puppet *Puppet) LoadRoom(roomID string) *mautrix.Room { return nil }
+func (puppet *Puppet) SaveFilterID(_ id.UserID, _ string)    {}
+func (puppet *Puppet) SaveNextBatch(_ id.UserID, nbt string) { puppet.NextBatch = nbt; puppet.Update() }
+func (puppet *Puppet) SaveRoom(_ *mautrix.Room)              {}
+func (puppet *Puppet) LoadFilterID(_ id.UserID) string       { return "" }
+func (puppet *Puppet) LoadNextBatch(_ id.UserID) string      { return puppet.NextBatch }
+func (puppet *Puppet) LoadRoom(_ id.RoomID) *mautrix.Room    { return nil }

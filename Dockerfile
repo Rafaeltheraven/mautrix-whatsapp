@@ -1,20 +1,17 @@
-FROM golang:1.12-alpine AS builder
+FROM golang:1-alpine3.13 AS builder
 
-RUN apk add --no-cache git ca-certificates build-base su-exec
-
-WORKDIR /build
-COPY go.mod go.sum /build/
-RUN go get
+RUN apk add --no-cache git ca-certificates build-base su-exec olm-dev
 
 COPY . /build
+WORKDIR /build
 RUN go build -o /usr/bin/mautrix-whatsapp
 
-FROM alpine:latest
+FROM alpine:3.13
 
 ENV UID=1337 \
     GID=1337
 
-RUN apk add --no-cache su-exec ca-certificates
+RUN apk add --no-cache ffmpeg su-exec ca-certificates olm bash jq yq curl
 
 COPY --from=builder /usr/bin/mautrix-whatsapp /usr/bin/mautrix-whatsapp
 COPY --from=builder /build/example-config.yaml /opt/mautrix-whatsapp/example-config.yaml

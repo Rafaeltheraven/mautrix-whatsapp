@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2019 Tulir Asokan
+// Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -20,12 +20,15 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"strings"
+	"time"
 
+	"github.com/Rhymen/go-whatsapp"
 	waProto "github.com/Rhymen/go-whatsapp/binary/proto"
 
 	log "maunium.net/go/maulogger/v2"
 
-	"maunium.net/go/mautrix-whatsapp/types"
+	"maunium.net/go/mautrix/id"
 )
 
 type MessageQuery struct {
@@ -41,7 +44,7 @@ func (mq *MessageQuery) New() *Message {
 }
 
 func (mq *MessageQuery) GetAll(chat PortalKey) (messages []*Message) {
-	rows, err := mq.db.Query("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, content FROM message WHERE chat_jid=$1 AND chat_receiver=$2", chat.JID, chat.Receiver)
+	rows, err := mq.db.Query("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content FROM message WHERE chat_jid=$1 AND chat_receiver=$2", chat.JID, chat.Receiver)
 	if err != nil || rows == nil {
 		return nil
 	}
@@ -52,19 +55,24 @@ func (mq *MessageQuery) GetAll(chat PortalKey) (messages []*Message) {
 	return
 }
 
-func (mq *MessageQuery) GetByJID(chat PortalKey, jid types.WhatsAppMessageID) *Message {
-	return mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, content " +
+func (mq *MessageQuery) GetByJID(chat PortalKey, jid whatsapp.MessageID) *Message {
+	return mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content "+
 		"FROM message WHERE chat_jid=$1 AND chat_receiver=$2 AND jid=$3", chat.JID, chat.Receiver, jid)
 }
 
-func (mq *MessageQuery) GetByMXID(mxid types.MatrixEventID) *Message {
-	return mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, content " +
+func (mq *MessageQuery) GetByMXID(mxid id.EventID) *Message {
+	return mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content "+
 		"FROM message WHERE mxid=$1", mxid)
 }
 
 func (mq *MessageQuery) GetLastInChat(chat PortalKey) *Message {
-	msg := mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, content " +
-		"FROM message WHERE chat_jid=$1 AND chat_receiver=$2 ORDER BY timestamp DESC LIMIT 1", chat.JID, chat.Receiver)
+	return mq.GetLastInChatBefore(chat, time.Now().Unix()+60)
+}
+
+func (mq *MessageQuery) GetLastInChatBefore(chat PortalKey, maxTimestamp int64) *Message {
+	msg := mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content "+
+		"FROM message WHERE chat_jid=$1 AND chat_receiver=$2 AND timestamp<=$3 AND sent=true ORDER BY timestamp DESC LIMIT 1",
+		chat.JID, chat.Receiver, maxTimestamp)
 	if msg == nil || msg.Timestamp == 0 {
 		// Old db, we don't know what the last message is.
 		return nil
@@ -85,16 +93,21 @@ type Message struct {
 	log log.Logger
 
 	Chat      PortalKey
-	JID       types.WhatsAppMessageID
-	MXID      types.MatrixEventID
-	Sender    types.WhatsAppID
-	Timestamp uint64
+	JID       whatsapp.MessageID
+	MXID      id.EventID
+	Sender    whatsapp.JID
+	Timestamp int64
+	Sent      bool
 	Content   *waProto.Message
+}
+
+func (msg *Message) IsFakeMXID() bool {
+	return strings.HasPrefix(msg.MXID.String(), "net.maunium.whatsapp.fake::")
 }
 
 func (msg *Message) Scan(row Scannable) *Message {
 	var content []byte
-	err := row.Scan(&msg.Chat.JID, &msg.Chat.Receiver, &msg.JID, &msg.MXID, &msg.Sender, &msg.Timestamp, &content)
+	err := row.Scan(&msg.Chat.JID, &msg.Chat.Receiver, &msg.JID, &msg.MXID, &msg.Sender, &msg.Timestamp, &msg.Sent, &content)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			msg.log.Errorln("Database scan failed:", err)
@@ -128,11 +141,20 @@ func (msg *Message) encodeBinaryContent() []byte {
 }
 
 func (msg *Message) Insert() {
-	_, err := msg.db.Exec("INSERT INTO message (chat_jid, chat_receiver, jid, mxid, sender, timestamp, content) " +
-		"VALUES ($1, $2, $3, $4, $5, $6, $7)",
-		msg.Chat.JID, msg.Chat.Receiver, msg.JID, msg.MXID, msg.Sender, msg.Timestamp, msg.encodeBinaryContent())
+	_, err := msg.db.Exec(`INSERT INTO message
+			(chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		msg.Chat.JID, msg.Chat.Receiver, msg.JID, msg.MXID, msg.Sender, msg.Timestamp, msg.Sent, msg.encodeBinaryContent())
 	if err != nil {
 		msg.log.Warnfln("Failed to insert %s@%s: %v", msg.Chat, msg.JID, err)
+	}
+}
+
+func (msg *Message) MarkSent() {
+	msg.Sent = true
+	_, err := msg.db.Exec("UPDATE message SET sent=true WHERE chat_jid=$1 AND chat_receiver=$2 AND jid=$3", msg.Chat.JID, msg.Chat.Receiver, msg.JID)
+	if err != nil {
+		msg.log.Warnfln("Failed to update %s@%s: %v", msg.Chat, msg.JID, err)
 	}
 }
 

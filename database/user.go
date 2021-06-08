@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2019 Tulir Asokan
+// Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -26,8 +26,7 @@ import (
 
 	log "maunium.net/go/maulogger/v2"
 
-	"maunium.net/go/mautrix-whatsapp/types"
-	"maunium.net/go/mautrix-whatsapp/whatsapp-ext"
+	"maunium.net/go/mautrix/id"
 )
 
 type UserQuery struct {
@@ -54,7 +53,7 @@ func (uq *UserQuery) GetAll() (users []*User) {
 	return
 }
 
-func (uq *UserQuery) GetByMXID(userID types.MatrixUserID) *User {
+func (uq *UserQuery) GetByMXID(userID id.UserID) *User {
 	row := uq.db.QueryRow(`SELECT mxid, jid, management_room, last_connection, client_id, client_token, server_token, enc_key, mac_key FROM "user" WHERE mxid=$1`, userID)
 	if row == nil {
 		return nil
@@ -62,7 +61,7 @@ func (uq *UserQuery) GetByMXID(userID types.MatrixUserID) *User {
 	return uq.New().Scan(row)
 }
 
-func (uq *UserQuery) GetByJID(userID types.WhatsAppID) *User {
+func (uq *UserQuery) GetByJID(userID whatsapp.JID) *User {
 	row := uq.db.QueryRow(`SELECT mxid, jid, management_room, last_connection, client_id, client_token, server_token, enc_key, mac_key FROM "user" WHERE jid=$1`, stripSuffix(userID))
 	if row == nil {
 		return nil
@@ -74,11 +73,11 @@ type User struct {
 	db  *Database
 	log log.Logger
 
-	MXID           types.MatrixUserID
-	JID            types.WhatsAppID
-	ManagementRoom types.MatrixRoomID
+	MXID           id.UserID
+	JID            whatsapp.JID
+	ManagementRoom id.RoomID
 	Session        *whatsapp.Session
-	LastConnection uint64
+	LastConnection int64
 }
 
 func (user *User) Scan(row Scannable) *User {
@@ -92,14 +91,14 @@ func (user *User) Scan(row Scannable) *User {
 		return nil
 	}
 	if len(jid.String) > 0 && len(clientID.String) > 0 {
-		user.JID = jid.String + whatsappExt.NewUserSuffix
+		user.JID = jid.String + whatsapp.NewUserSuffix
 		user.Session = &whatsapp.Session{
-			ClientId:    clientID.String,
+			ClientID:    clientID.String,
 			ClientToken: clientToken.String,
 			ServerToken: serverToken.String,
 			EncKey:      encKey,
 			MacKey:      macKey,
-			Wid:         jid.String + whatsappExt.OldUserSuffix,
+			Wid:         jid.String + whatsapp.OldUserSuffix,
 		}
 	} else {
 		user.Session = nil
@@ -107,7 +106,7 @@ func (user *User) Scan(row Scannable) *User {
 	return user
 }
 
-func stripSuffix(jid types.WhatsAppID) string {
+func stripSuffix(jid whatsapp.JID) string {
 	if len(jid) == 0 {
 		return jid
 	}
@@ -140,14 +139,14 @@ func (user *User) Insert() {
 	_, err := user.db.Exec(`INSERT INTO "user" (mxid, jid, management_room, last_connection, client_id, client_token, server_token, enc_key, mac_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		user.MXID, user.jidPtr(),
 		user.ManagementRoom, user.LastConnection,
-		sess.ClientId, sess.ClientToken, sess.ServerToken, sess.EncKey, sess.MacKey)
+		sess.ClientID, sess.ClientToken, sess.ServerToken, sess.EncKey, sess.MacKey)
 	if err != nil {
 		user.log.Warnfln("Failed to insert %s: %v", user.MXID, err)
 	}
 }
 
 func (user *User) UpdateLastConnection() {
-	user.LastConnection = uint64(time.Now().Unix())
+	user.LastConnection = time.Now().Unix()
 	_, err := user.db.Exec(`UPDATE "user" SET last_connection=$1 WHERE mxid=$2`,
 		user.LastConnection, user.MXID)
 	if err != nil {
@@ -159,7 +158,7 @@ func (user *User) Update() {
 	sess := user.sessionUnptr()
 	_, err := user.db.Exec(`UPDATE "user" SET jid=$1, management_room=$2, last_connection=$3, client_id=$4, client_token=$5, server_token=$6, enc_key=$7, mac_key=$8 WHERE mxid=$9`,
 		user.jidPtr(), user.ManagementRoom, user.LastConnection,
-		sess.ClientId, sess.ClientToken, sess.ServerToken, sess.EncKey, sess.MacKey,
+		sess.ClientID, sess.ClientToken, sess.ServerToken, sess.EncKey, sess.MacKey,
 		user.MXID)
 	if err != nil {
 		user.log.Warnfln("Failed to update %s: %v", user.MXID, err)
@@ -245,4 +244,15 @@ func (user *User) GetInCommunityMap() map[PortalKey]bool {
 		keys[key] = inCommunity
 	}
 	return keys
+}
+
+func (user *User) CreateUserPortal(newKey PortalKeyWithMeta) {
+	user.log.Debugfln("Creating new portal %s for %s", newKey.PortalKey.JID, newKey.PortalKey.Receiver)
+	_, err := user.db.Exec(`INSERT INTO user_portal (user_jid, portal_jid, portal_receiver, in_community) VALUES ($1, $2, $3, $4)`,
+		user.jidPtr(),
+		newKey.PortalKey.JID, newKey.PortalKey.Receiver,
+		newKey.InCommunity)
+	if err != nil {
+		user.log.Warnfln("Failed to insert %s: %v", user.MXID, err)
+	}
 }

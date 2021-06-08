@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2019 Tulir Asokan
+// Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -22,23 +22,25 @@ import (
 
 	log "maunium.net/go/maulogger/v2"
 
-	"maunium.net/go/mautrix-whatsapp/types"
+	"github.com/Rhymen/go-whatsapp"
+
+	"maunium.net/go/mautrix/id"
 )
 
 type PortalKey struct {
-	JID      types.WhatsAppID
-	Receiver types.WhatsAppID
+	JID      whatsapp.JID
+	Receiver whatsapp.JID
 }
 
-func GroupPortalKey(jid types.WhatsAppID) PortalKey {
+func GroupPortalKey(jid whatsapp.JID) PortalKey {
 	return PortalKey{
 		JID:      jid,
 		Receiver: jid,
 	}
 }
 
-func NewPortalKey(jid, receiver types.WhatsAppID) PortalKey {
-	if strings.HasSuffix(jid, "@g.us") {
+func NewPortalKey(jid, receiver whatsapp.JID) PortalKey {
+	if strings.HasSuffix(jid, whatsapp.GroupSuffix) {
 		receiver = jid
 	}
 	return PortalKey{
@@ -74,12 +76,16 @@ func (pq *PortalQuery) GetByJID(key PortalKey) *Portal {
 	return pq.get("SELECT * FROM portal WHERE jid=$1 AND receiver=$2", key.JID, key.Receiver)
 }
 
-func (pq *PortalQuery) GetByMXID(mxid types.MatrixRoomID) *Portal {
+func (pq *PortalQuery) GetByMXID(mxid id.RoomID) *Portal {
 	return pq.get("SELECT * FROM portal WHERE mxid=$1", mxid)
 }
 
-func (pq *PortalQuery) GetAllByJID(jid types.WhatsAppID) []*Portal {
+func (pq *PortalQuery) GetAllByJID(jid whatsapp.JID) []*Portal {
 	return pq.getAll("SELECT * FROM portal WHERE jid=$1", jid)
+}
+
+func (pq *PortalQuery) FindPrivateChats(receiver whatsapp.JID) []*Portal {
+	return pq.getAll("SELECT * FROM portal WHERE receiver=$1 AND jid LIKE '%@s.whatsapp.net'", receiver)
 }
 
 func (pq *PortalQuery) getAll(query string, args ...interface{}) (portals []*Portal) {
@@ -107,29 +113,30 @@ type Portal struct {
 	log log.Logger
 
 	Key  PortalKey
-	MXID types.MatrixRoomID
+	MXID id.RoomID
 
 	Name      string
 	Topic     string
 	Avatar    string
-	AvatarURL string
+	AvatarURL id.ContentURI
+	Encrypted bool
 }
 
 func (portal *Portal) Scan(row Scannable) *Portal {
 	var mxid, avatarURL sql.NullString
-	err := row.Scan(&portal.Key.JID, &portal.Key.Receiver, &mxid, &portal.Name, &portal.Topic, &portal.Avatar, &avatarURL)
+	err := row.Scan(&portal.Key.JID, &portal.Key.Receiver, &mxid, &portal.Name, &portal.Topic, &portal.Avatar, &avatarURL, &portal.Encrypted)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			portal.log.Errorln("Database scan failed:", err)
 		}
 		return nil
 	}
-	portal.MXID = mxid.String
-	portal.AvatarURL = avatarURL.String
+	portal.MXID = id.RoomID(mxid.String)
+	portal.AvatarURL, _ = id.ParseContentURI(avatarURL.String)
 	return portal
 }
 
-func (portal *Portal) mxidPtr() *string {
+func (portal *Portal) mxidPtr() *id.RoomID {
 	if len(portal.MXID) > 0 {
 		return &portal.MXID
 	}
@@ -137,20 +144,20 @@ func (portal *Portal) mxidPtr() *string {
 }
 
 func (portal *Portal) Insert() {
-	_, err := portal.db.Exec("INSERT INTO portal VALUES ($1, $2, $3, $4, $5, $6, $7)",
-		portal.Key.JID, portal.Key.Receiver, portal.mxidPtr(), portal.Name, portal.Topic, portal.Avatar, portal.AvatarURL)
+	_, err := portal.db.Exec("INSERT INTO portal (jid, receiver, mxid, name, topic, avatar, avatar_url, encrypted) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+		portal.Key.JID, portal.Key.Receiver, portal.mxidPtr(), portal.Name, portal.Topic, portal.Avatar, portal.AvatarURL.String(), portal.Encrypted)
 	if err != nil {
 		portal.log.Warnfln("Failed to insert %s: %v", portal.Key, err)
 	}
 }
 
 func (portal *Portal) Update() {
-	var mxid *string
+	var mxid *id.RoomID
 	if len(portal.MXID) > 0 {
 		mxid = &portal.MXID
 	}
-	_, err := portal.db.Exec("UPDATE portal SET mxid=$1, name=$2, topic=$3, avatar=$4, avatar_url=$5 WHERE jid=$6 AND receiver=$7",
-		mxid, portal.Name, portal.Topic, portal.Avatar, portal.AvatarURL, portal.Key.JID, portal.Key.Receiver)
+	_, err := portal.db.Exec("UPDATE portal SET mxid=$1, name=$2, topic=$3, avatar=$4, avatar_url=$5, encrypted=$6 WHERE jid=$7 AND receiver=$8",
+		mxid, portal.Name, portal.Topic, portal.Avatar, portal.AvatarURL.String(), portal.Encrypted, portal.Key.JID, portal.Key.Receiver)
 	if err != nil {
 		portal.log.Warnfln("Failed to update %s: %v", portal.Key, err)
 	}
@@ -163,7 +170,7 @@ func (portal *Portal) Delete() {
 	}
 }
 
-func (portal *Portal) GetUserIDs() []types.MatrixUserID {
+func (portal *Portal) GetUserIDs() []id.UserID {
 	rows, err := portal.db.Query(`SELECT "user".mxid FROM "user", user_portal
 		WHERE "user".jid=user_portal.user_jid
 			AND user_portal.portal_jid=$1
@@ -173,9 +180,9 @@ func (portal *Portal) GetUserIDs() []types.MatrixUserID {
 		portal.log.Debugln("Failed to get portal user ids:", err)
 		return nil
 	}
-	var userIDs []types.MatrixUserID
+	var userIDs []id.UserID
 	for rows.Next() {
-		var userID types.MatrixUserID
+		var userID id.UserID
 		err = rows.Scan(&userID)
 		if err != nil {
 			portal.log.Warnln("Failed to scan row:", err)

@@ -20,14 +20,17 @@ import (
 	"io/ioutil"
 
 	"gopkg.in/yaml.v2"
+	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-appservice"
+	"maunium.net/go/mautrix/appservice"
 )
 
 type Config struct {
 	Homeserver struct {
-		Address string `yaml:"address"`
-		Domain  string `yaml:"domain"`
+		Address        string `yaml:"address"`
+		Domain         string `yaml:"domain"`
+		Asmux          bool   `yaml:"asmux"`
+		StatusEndpoint string `yaml:"status_endpoint"`
 	} `yaml:"homeserver"`
 
 	AppService struct {
@@ -61,14 +64,37 @@ type Config struct {
 		HSToken string `yaml:"hs_token"`
 	} `yaml:"appservice"`
 
+	Metrics struct {
+		Enabled bool   `yaml:"enabled"`
+		Listen  string `yaml:"listen"`
+	} `yaml:"metrics"`
+
+	WhatsApp struct {
+		OSName      string `yaml:"os_name"`
+		BrowserName string `yaml:"browser_name"`
+	} `yaml:"whatsapp"`
+
 	Bridge BridgeConfig `yaml:"bridge"`
 
 	Logging appservice.LogConfig `yaml:"logging"`
 }
 
+func (config *Config) CanDoublePuppet(userID id.UserID) bool {
+	if len(config.Bridge.LoginSharedSecret) == 0 {
+		// Automatic login not enabled
+		return false
+	} else if _, homeserver, _ := userID.Parse(); homeserver != config.Homeserver.Domain {
+		// user is on another homeserver
+		return false
+	}
+	return true
+}
+
 func (config *Config) setDefaults() {
 	config.AppService.Database.MaxOpenConns = 20
 	config.AppService.Database.MaxIdleConns = 2
+	config.WhatsApp.OSName = "Mautrix-WhatsApp bridge"
+	config.WhatsApp.BrowserName = "mx-wa"
 	config.Bridge.setDefaults()
 }
 
@@ -98,6 +124,7 @@ func (config *Config) MakeAppService() (*appservice.AppService, error) {
 	as.HomeserverURL = config.Homeserver.Address
 	as.Host.Hostname = config.AppService.Hostname
 	as.Host.Port = config.AppService.Port
+	as.DefaultHTTPRetries = 4
 	var err error
 	as.Registration, err = config.GetRegistration()
 	return as, err
